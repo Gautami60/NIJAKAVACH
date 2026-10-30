@@ -12,9 +12,12 @@
     "test": "turbo run test",
     "infra:up": "docker compose -f infrastructure/docker/docker-compose.yml up -d",
     "infra:down": "docker compose -f infrastructure/docker/docker-compose.yml down",
-    "infra:status": "docker compose -f infrastructure/docker/docker-compose.yml ps"
+    "infra:status": "docker compose -f infrastructure/docker/docker-compose.yml ps",
+    "db:migrate": "tsx scripts/init-db.ts",
+    "db:seed": "tsx scripts/seed-db.ts"
   },
   "devDependencies": {
+    "tsx": "^4.19.3",
     "turbo": "^2.4.4",
     "typescript": "^5.8.2"
   }

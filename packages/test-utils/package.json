@@ -7,9 +7,11 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "node --test dist/database-invariants.test.js",
     "lint": "echo 'No lint needed for test-utils'"
   },
   "dependencies": {
+    "@nijakavach/security": "workspace:*",
     "@nijakavach/shared-types": "workspace:*"
   },
   "devDependencies": {

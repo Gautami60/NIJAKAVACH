@@ -168,17 +168,25 @@ docker compose -f infrastructure/docker/docker-compose.yml up -d
 
 ---
 
-## 8. Database Initialization & Seeding
+## 8. Database Architecture & Migrations
 
-NIJAKAVACH partitions data into 9 isolated PostgreSQL schemas (`identity`, `user_consent`, `sources`, `discovery`, `cases`, `removals`, `verification`, `notifications`, `audit`) with non-overlapping database roles:
+NIJAKAVACH partitions data into 9 isolated PostgreSQL schemas (`identity`, `user_consent`, `sources`, `discovery`, `cases`, `removals`, `verification`, `notifications`, `audit`) with non-overlapping database roles, zero cross-schema foreign keys, and dedicated transactional outbox tables:
 
 ```bash
-# Verify and apply database schema initialization
+# Verify and apply database schema initialization and DDL migrations
 pnpm db:migrate
 
 # Seed initial verified Indian directory sources into the catalog
 pnpm db:seed
+
+# Run database invariant tests (verifies zero cross-schema FKs, UUID PKs, HMAC lookups, AES encryption)
+pnpm --filter @nijakavach/test-utils test
 ```
+
+Migration files located in `infrastructure/postgres/migrations/`:
+- `001_initial_schema_and_roles.sql`: Logical schemas and least-privilege service roles.
+- `002_core_domain_tables.sql`: 34 domain tables, check constraints, indexes, and outbox tables.
+- `seeds/dev-seed.sql`: Catalog of verified Indian directories and compliance policies.
 
 ---
 

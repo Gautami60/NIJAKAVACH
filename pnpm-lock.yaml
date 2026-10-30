@@ -166,6 +166,9 @@ importers:
 
   .:
     devDependencies:
+      tsx:
+        specifier: ^4.19.3
+        version: 4.23.15
       turbo:
         specifier: ^2.4.4
         version: 2.11.10
@@ -671,6 +674,9 @@ importers:
 
   packages/test-utils:
     dependencies:
+      '@nijakavach/security':
+        specifier: workspace:*
+        version: link:../security
       '@nijakavach/shared-types':
         specifier: workspace:*
         version: link:../shared-types
