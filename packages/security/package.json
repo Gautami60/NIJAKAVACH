@@ -1,0 +1,21 @@
+{
+  "name": "@nijakavach/security",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/index.test.js",
+    "lint": "echo 'No lint needed for security'"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  }
+}

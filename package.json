@@ -1,0 +1,21 @@
+{
+  "name": "nijakavach",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NIJAKAVACH — Personal Data Exposure Discovery and Removal Management Platform",
+  "packageManager": "pnpm@12.16.1",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "infra:up": "docker compose -f infrastructure/docker/docker-compose.yml up -d",
+    "infra:down": "docker compose -f infrastructure/docker/docker-compose.yml down",
+    "infra:status": "docker compose -f infrastructure/docker/docker-compose.yml ps"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.4",
+    "typescript": "^5.8.2"
+  }
+}

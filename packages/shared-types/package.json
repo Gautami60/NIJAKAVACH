@@ -1,0 +1,15 @@
+{
+  "name": "@nijakavach/shared-types",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'No lint needed for types'"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "rabbit_version": "3.13.0",
+  "users": [
+    {
+      "name": "nijakavach",
+      "password_hash": "kYQ8yC7pLz15qZ1R87d+X4hZ57k=",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": ["administrator"]
+    }
+  ],
+  "vhosts": [
+    {
+      "name": "/"
+    }
+  ],
+  "permissions": [
+    {
+      "user": "nijakavach",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "nijakavach.events.topic",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false
+    },
+    {
+      "name": "nijakavach.jobs.direct",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false
+    },
+    {
+      "name": "jobs.discovery.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false
+    },
+    {
+      "name": "jobs.removal.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false
+    }
+  ],
+  "queues": [
+    {
+      "name": "jobs.discovery.source-check",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "jobs.discovery.dlx",
+        "x-dead-letter-routing-key": "discovery.failed"
+      }
+    },
+    {
+      "name": "jobs.discovery.failed",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "jobs.removal.submit",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "jobs.removal.dlx",
+        "x-dead-letter-routing-key": "removal.failed"
+      }
+    },
+    {
+      "name": "jobs.removal.failed",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "events.audit.ledger",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "events.notifications.dispatch",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+  "bindings": [
+    {
+      "source": "nijakavach.jobs.direct",
+      "vhost": "/",
+      "destination": "jobs.discovery.source-check",
+      "destination_type": "queue",
+      "routing_key": "discovery.source-check",
+      "arguments": {}
+    },
+    {
+      "source": "nijakavach.jobs.direct",
+      "vhost": "/",
+      "destination": "jobs.removal.submit",
+      "destination_type": "queue",
+      "routing_key": "removal.submit",
+      "arguments": {}
+    },
+    {
+      "source": "jobs.discovery.dlx",
+      "vhost": "/",
+      "destination": "jobs.discovery.failed",
+      "destination_type": "queue",
+      "routing_key": "discovery.failed",
+      "arguments": {}
+    },
+    {
+      "source": "jobs.removal.dlx",
+      "vhost": "/",
+      "destination": "jobs.removal.failed",
+      "destination_type": "queue",
+      "routing_key": "removal.failed",
+      "arguments": {}
+    },
+    {
+      "source": "nijakavach.events.topic",
+      "vhost": "/",
+      "destination": "events.audit.ledger",
+      "destination_type": "queue",
+      "routing_key": "nijakavach.#",
+      "arguments": {}
+    },
+    {
+      "source": "nijakavach.events.topic",
+      "vhost": "/",
+      "destination": "events.notifications.dispatch",
+      "destination_type": "queue",
+      "routing_key": "nijakavach.*.*.completed",
+      "arguments": {}
+    }
+  ]
+}

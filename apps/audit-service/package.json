@@ -1,0 +1,25 @@
+{
+  "name": "@nijakavach/audit-service",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/main.test.js"
+  },
+  "dependencies": {
+    "@nijakavach/config": "workspace:*",
+    "@nijakavach/contracts": "workspace:*",
+    "@nijakavach/event-contracts": "workspace:*",
+    "@nijakavach/logger": "workspace:*",
+    "@nijakavach/observability": "workspace:*",
+    "@nijakavach/shared-types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
