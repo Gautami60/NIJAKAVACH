@@ -184,9 +184,23 @@ pnpm --filter @nijakavach/test-utils test
 ```
 
 Migration files located in `infrastructure/postgres/migrations/`:
-- `001_initial_schema_and_roles.sql`: Logical schemas and least-privilege service roles.
-- `002_core_domain_tables.sql`: 34 domain tables, check constraints, indexes, and outbox tables.
+- `001_initial_schema_and_roles.sql`: Logical schemas and least-privilege service roles (`identity_svc_role`, `sources_svc_role`, etc.).
+- `002_core_domain_tables.sql`: 34 domain tables, check constraints, indexes, and transactional outbox tables.
+- `003_source_registry_capabilities.sql`: Enterprise metadata, capability verification, evidence tracking, safe integrations, and removal procedures for schema `sources`.
 - `seeds/dev-seed.sql`: Catalog of verified Indian directories and compliance policies.
+
+### Source Registry Service PostgreSQL Configuration
+The Source Registry Service (`apps/source-registry-service`) connects to PostgreSQL using least-privilege role `sources_svc_role`:
+- **Default Connection String**: `postgresql://sources_svc_role:sources_dev_pwd@localhost:5432/nijakavach_dev?schema=sources`
+- **Environment Variables**:
+  - `SOURCES_DB_URL`: Custom PostgreSQL connection string for the `sources` schema.
+  - `USE_POSTGRES`: `true` to enable live PostgreSQL pool; `false` to fallback to structural in-memory repositories.
+- **Service-Level Migrations**: Run automatically on boot via `SourceRegistryMigrator` tracking applied scripts in `sources.schema_migrations`.
+- **Testing Persistence**:
+  ```bash
+  # Run Source Registry unit and integration test suite
+  pnpm --filter @nijakavach/source-registry-service test
+  ```
 
 ---
 
@@ -217,35 +231,70 @@ pnpm --filter @nijakavach/user-service dev
 
 ### Service Port & Health Check Matrix
 
-Every service exposes a standardized `/health` endpoint returning uptime and database/queue statuses:
+Every service exposes a standardized `/health` (liveness probe) and `/ready` (dependency readiness probe) endpoint:
 
-| Service | Port | Health Endpoint |
-| :--- | :--- | :--- |
-| **Web Frontend** | `3000` | `http://localhost:3000` |
-| **API Gateway** | `4000` | `http://localhost:4000/health` |
-| **Identity Service** | `4001` | `http://localhost:4001/health` |
-| **User & Consent Service** | `4002` | `http://localhost:4002/health` |
-| **Source Registry Service** | `4003` | `http://localhost:4003/health` |
-| **Discovery Service** | `4004` | `http://localhost:4004/health` |
-| **Case Management Service** | `4005` | `http://localhost:4005/health` |
-| **Removal Workflow Service**| `4006` | `http://localhost:4006/health` |
-| **Verification Service** | `4007` | `http://localhost:4007/health` |
-| **Notification Service** | `4008` | `http://localhost:4008/health` |
-| **Audit Service** | `4009` | `http://localhost:4009/health` |
-| **Source Workers Daemon** | `4010` | `http://localhost:4010/health` |
+| Service | Port | Liveness Probe | Readiness Probe | Direct Access Policy |
+| :--- | :--- | :--- | :--- | :--- |
+| **Web Frontend** | `3000` | `http://localhost:3000` | N/A | Public |
+| **API Gateway** | `4000` | `http://localhost:4000/health` | `http://localhost:4000/ready` | Public ingress |
+| **Identity Service** | `4001` | `http://localhost:4001/health` | `http://localhost:4001/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **User & Consent Service** | `4002` | `http://localhost:4002/health` | `http://localhost:4002/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Source Registry Service** | `4003` | `http://localhost:4003/health` | `http://localhost:4003/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Discovery Service** | `4004` | `http://localhost:4004/health` | `http://localhost:4004/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Case Management Service** | `4005` | `http://localhost:4005/health` | `http://localhost:4005/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Removal Workflow Service**| `4006` | `http://localhost:4006/health` | `http://localhost:4006/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Verification Service** | `4007` | `http://localhost:4007/health` | `http://localhost:4007/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Notification Service** | `4008` | `http://localhost:4008/health` | `http://localhost:4008/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Audit Service** | `4009` | `http://localhost:4009/health` | `http://localhost:4009/ready` | Internal key required (`X-Internal-Service-Key`) |
+| **Source Workers Daemon** | `4010` | `http://localhost:4010/health` | `http://localhost:4010/ready` | Internal key required (`X-Internal-Service-Key`) |
+
+### API Gateway Route Mapping & Security
+
+All client traffic routes through the API Gateway (`http://localhost:4000`). Direct requests to internal microservices without a valid internal service key are blocked with HTTP 403 Forbidden.
+
+| Gateway Route Prefix | Target Downstream Service | Auth Required | Rewrite Target |
+| :--- | :--- | :--- | :--- |
+| `/api/v1/identity` | `apps/identity-service:4001` | No (endpoints self-authenticate) | `/v1/identity` |
+| `/api/v1/users` | `apps/user-service:4002` | Yes (Bearer JWT) | `/v1/users` |
+| `/api/v1/consents` | `apps/user-service:4002` | Yes (Bearer JWT) | `/v1/consents` |
+| `/api/v1/authorisations` | `apps/user-service:4002` | Yes (Bearer JWT) | `/v1/authorisations` |
+| `/api/v1/sources` | `apps/source-registry-service:4003` | Public for `GET` (redacted catalogue); Admin Bearer JWT (`SYSTEM_ADMIN` / `COMPLIANCE_OFFICER`) for mutations | `/v1/sources` |
+| `/api/v1/scans` | `apps/discovery-service:4004` | Yes (Bearer JWT) | `/v1/scans` |
+| `/api/v1/cases` | `apps/case-management-service:4005` | Yes (Bearer JWT) | `/v1/cases` |
+| `/api/v1/removals` | `apps/removal-workflow-service:4006` | Yes (Bearer JWT) | `/v1/removals` |
+| `/api/v1/verification` | `apps/verification-service:4007` | Yes (Bearer JWT) | `/v1/verifications` |
+
+**Security Controls Enforced by Gateway**:
+- **Sliding-Window Rate Limiter**: 100 requests / minute per IP (returns `429 Too Many Requests` with `Retry-After`).
+- **Max Body Size Limit**: 1MB maximum payload (returns `413 Payload Too Large`).
+- **Request Timeouts**: 10s request timeout guard (returns `504 Gateway Timeout`).
+- **Header Sanitization**: Gateway unconditionally strips client-injected `X-User-Id`, `X-User-Roles`, and `X-Internal-Service-Key` headers before proxying, injecting authenticated user claims from the verified JWT.
+- **Security Headers**: Standard injection of `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'`, and `X-Correlation-Id`.
 
 ---
 
 ## 10. Testing Commands
 
-Run automated tests across all packages and services:
+Run automated tests across backend foundation modules:
 
 ```bash
-# Run unit and contract tests across all 21 packages and applications
-pnpm test
+# Run Identity Service tests (registration, Scrypt, email verification, login, refresh rotation, password reset)
+pnpm --filter @nijakavach/identity-service test
 
-# Run strict TypeScript type checks across all targets
-pnpm typecheck
+# Run User & Consent Service tests (profiles, phone normalization, AES-256-GCM, HMAC, DPDP consent, authorisations, erasure)
+pnpm --filter @nijakavach/user-service test
+
+# Run API Gateway foundation tests (routing, auth guard, rate limiter, header sanitization)
+pnpm --filter @nijakavach/api-gateway test
+
+# Run Source Worker pool tests (concurrency, idempotency, timeouts, retry backoff, DLQ)
+pnpm --filter @nijakavach/source-workers test
+
+# Run Database and Service Communication invariants (CloudEvents, Outbox, Backoff, Timing-safe keys)
+pnpm --filter @nijakavach/test-utils test
+
+# Run strict TypeScript type checks across all backend targets
+pnpm --filter "!@nijakavach/web" typecheck
 ```
 
 ---

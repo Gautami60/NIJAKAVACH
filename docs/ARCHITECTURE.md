@@ -147,18 +147,45 @@ graph TD
 
 ## 4. Service Communication
 
-### A. Synchronous HTTP Ingress
-- Client browser requests enter through the **API Gateway** (`apps/api-gateway:4000`) over HTTPS.
-- Gateway injects standard security headers (`Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`).
-- Gateway generates a unique correlation ID (`X-Correlation-Id: corr-<uuid>`) if not present, and forwards requests to internal microservices with `X-User-Id` and `X-Internal-Service-Key`.
+### A. Synchronous HTTP Ingress & Service-to-Service Protocol
+- **API Gateway Entry Point (`apps/api-gateway:4000`)**:
+  - Serves as the single public entry point for all client applications and traffic.
+  - Enforces route mapping to internal microservices:
+    - `/api/v1/identity` → `apps/identity-service:4001/v1/identity` (Public registration, login, token refresh)
+    - `/api/v1/users` → `apps/user-service:4002/v1/users` (Protected user profile, identifiers, DPDP consent)
+    - `/api/v1/sources` → `apps/source-registry-service:4003/v1/sources` (Public source catalog and policies)
+    - `/api/v1/scans` → `apps/discovery-service:4004/v1/scans` (Protected discovery scans and dispatch)
+    - `/api/v1/cases` → `apps/case-management-service:4005/v1/cases` (Protected exposure findings and review)
+    - `/api/v1/removals` → `apps/removal-workflow-service:4006/v1/removals` (Protected statutory removal requests)
+    - `/api/v1/verification` → `apps/verification-service:4007/v1/verifications` (Protected independent verification)
+- **Authentication & Spoofing Prevention**:
+  - Protected endpoints require a valid Bearer JWT. The gateway decodes and verifies the signature, extracting `userId` and `roles`.
+  - **Header Sanitization**: Gateway unconditionally strips client-injected `X-User-Id`, `X-User-Roles`, and `X-Internal-Service-Key` headers before proxying, and injects authenticated identity headers from the verified JWT.
+  - **Internal Service Key Protection**: Downstream microservices enforce `validateInternalServiceKey()` using constant-time comparison (`crypto.timingSafeEqual`). Any direct call bypassing the gateway without a valid internal key is rejected with HTTP 403 Forbidden.
+- **Synchronous Service Client**:
+  - Inter-service HTTP calls use `InternalServiceClient` from `@nijakavach/observability`, which automatically injects `X-Internal-Service-Key`, propagates `X-Correlation-Id`, and enforces strict timeout boundaries (default 10s).
 
-### B. Asynchronous Event-Driven Messaging
-- RabbitMQ 3.13 acts as the central asynchronous nervous system.
-- Exchange topology:
-  - `nijakavach.jobs.direct`: Direct exchange for point-to-point worker tasks (`discovery.source-check`, `removal.submit`, `verification.recheck`).
-  - `nijakavach.events.topic`: Topic exchange for distributed domain events (`nijakavach.#`).
-  - Dead-Letter Exchanges (`jobs.discovery.dlx`, `jobs.removal.dlx`) capture poison pills and exhausted retries.
-- Consumers acknowledge messages only after durable persistence (`ack`/`nack`). Retry policy uses exponential backoff with full jitter up to 5 attempts before routing to dead-letter queues.
+### B. Asynchronous Event-Driven Messaging & Outbox Engine
+- **CloudEvents v1.0 Standard Envelope**:
+  All distributed events conform to the CloudEvents v1.0 standard schema:
+  - `id`: Unique event UUID.
+  - `source`: URN identifying the producing service (e.g. `urn:nijakavach:service:discovery`).
+  - `specversion`: `"1.0"`.
+  - `type`: Structured domain event name (e.g. `nijakavach.discovery.scan.dispatched`).
+  - `time`: ISO-8601 UTC timestamp.
+  - `datacontenttype`: `"application/json"`.
+  - `correlationid`: Distributed tracing identifier propagated through headers and logs.
+  - `data`: Strongly-typed business event payload.
+- **Transactional Outbox Pattern**:
+  - To prevent dual-write anomalies between database updates and broker publishes, domain mutations write outbox records to their local schema table (`<schema>.outbox_messages`) in the same database transaction.
+  - Background outbox dispatchers (`OutboxDispatcher`) poll pending records, publish them to RabbitMQ, and transition status: `PENDING` → `DISPATCHED` or `FAILED` upon reaching retry thresholds.
+- **Broker Topology & Dead-Letter Routing**:
+  - `nijakavach.events.topic`: Topic exchange for domain events with pattern matching.
+  - `nijakavach.jobs.direct`: Direct exchange for discrete worker tasks (`discovery.source-check`, `removal.submit`, `verification.recheck`).
+  - Dead-Letter Queues (`*.dlx`): Unrecoverable messages or jobs exceeding maximum retry attempts are diverted to dead-letter queues with error reasons and timestamps for operator inspection and reprocessing.
+- **Idempotency & Resiliency**:
+  - Consumers use `IdempotencyTracker` with TTL tracking to guarantee that duplicated messages or redeliveries do not trigger duplicate external actions or state corruptions.
+  - Failed operations invoke exponential backoff with full jitter to prevent thundering herd spikes.
 
 ---
 
@@ -178,7 +205,7 @@ graph TD
             UC_T[user_profiles, personal_identifiers, consent_records, authorisation_records, data_deletion_requests, outbox_messages]
         end
         subgraph S3 [sources]
-            SR_T[sources, source_capabilities, source_health_records, source_policies, outbox_messages]
+            SR_T[sources, source_capabilities, source_evidence, source_integrations, source_policies, source_removal_procedures, source_health_records, outbox_messages]
         end
         subgraph S4 [discovery]
             DC_T[scans, scan_targets, source_checks, scan_results, outbox_messages]
@@ -254,12 +281,16 @@ Responsible for user privacy profile, encrypted personal identifiers, DPDP statu
 - **`user_consent.outbox_messages`**: Transactional outbox for user and consent events.
 
 #### 3. Source Registry Domain (`sources`)
-Responsible for cataloging lawful public directories, lead aggregators, opt-out capabilities, and operational health.
-- **`sources.sources`**: Directory source definitions. Columns: `id` (UUID PK), `name` (VARCHAR(128) UNIQUE), `slug` (VARCHAR(64) UNIQUE), `category` (CHECK: `PUBLIC_DIRECTORY`, `LEAD_AGGREGATOR`, `B2B_REGISTRY`, `PEOPLE_SEARCH`), `base_url`, `operational_status` (CHECK: `OPERATIONAL`, `DEGRADED`, `UNAVAILABLE`, `DISCONTINUED`), `rate_limit_per_minute` (INT), `created_at`, `updated_at`.
-- **`sources.source_capabilities`**: Granular discovery and removal capabilities. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `capability_type` (CHECK: `SEARCHABLE`, `AUTOMATED_API_REMOVAL`, `WEBFORM_OPT_OUT`, `EMAIL_NOTICE_REMOVAL`), `supported_identifier_types` (VARCHAR[]), `access_method` (CHECK: `PUBLIC_HTML_GET`, `PUBLIC_REST_API`, `WEBFORM_POST`, `GRIEVANCE_EMAIL`), `applicable_restrictions`, `compliance_endpoint`, `grievance_officer_email`. Composite UNIQUE (`source_id`, `capability_type`).
-- **`sources.source_health_records`**: Periodic availability telemetry. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `latency_ms`, `http_status`, `health_status` (CHECK: `OPERATIONAL`, `DEGRADED`, `UNAVAILABLE`), `checked_at`.
-- **`sources.source_policies`**: Statutory compliance terms and Grievance Officer details. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `statutory_framework` (`DPDP_ACT_2023`), `grievance_officer_email`, `postal_address`, `policy_version`, `terms_url`, `updated_at`.
-- **`sources.outbox_messages`**: Transactional outbox for source registry events.
+Responsible for cataloging lawful public directories, lead aggregators, opt-out capabilities, evidence requirements, and operational health. Persisted in PostgreSQL 16 schema `sources` under the least-privilege `sources_svc_role`.
+- **`sources.sources`**: Directory source definitions. Columns: `id` (UUID PK), `name` (VARCHAR(128) UNIQUE), `slug` (VARCHAR(64) UNIQUE), `display_name` (VARCHAR(128)), `category` (CHECK: `PUBLIC_DIRECTORY`, `DATA_BROKER`, `RECRUITMENT_PLATFORM`, `PEOPLE_SEARCH`, `MARKETPLACE`, `PUBLIC_REGISTRY`, `TELECOM_OPERATOR`, `LEAD_AGGREGATOR`, `B2B_REGISTRY`), `country` (VARCHAR(2)), `industry` (VARCHAR(64)), `base_url`, `operational_status` (CHECK: `ACTIVE`, `DEGRADED`, `DOWN`, `DISCONTINUED`, `UNDER_MAINTENANCE`, `OPERATIONAL`, `UNAVAILABLE`), `verification_status` (CHECK: `UNVERIFIED`, `RESEARCH_PENDING`, `VERIFIED_MANUAL`, `VERIFIED_AUTOMATED`, `DISPUTED`), `rate_limit_per_minute` (INT), `created_at`, `updated_at`.
+- **`sources.source_capabilities`**: Granular discovery, removal, verification, and monitoring capabilities. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `capability_type` (CHECK: `DISCOVERY`, `REMOVAL`, `VERIFICATION`, `ONGOING_MONITORING`), `status` (CHECK: `PLANNED`, `ACTIVE`, `DEGRADED`, `MAINTENANCE`, `DEPRECATED`), `verification_status` (CHECK: `UNVERIFIED`, `COMMUNITY_REPORTED`, `AUTOMATED_CHECKED`, `OPERATOR_CONFIRMED`), `supported_identifiers` (VARCHAR[]), `requires_auth` (BOOLEAN), `rate_limit_per_minute` (INT), `notes` (TEXT), `created_at`, `updated_at`. Composite UNIQUE (`source_id`, `capability_type`).
+- **`sources.source_evidence`**: Proof of personal information display and dispute records. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `evidence_type` (CHECK: `SCREENSHOT`, `URL_REFERENCE`, `USER_REPORT`, `SAMPLE_PAYLOAD`), `storage_url` (TEXT), `sha256_fingerprint` (VARCHAR(64)), `notes` (TEXT), `is_disputed` (BOOLEAN), `dispute_reason` (TEXT), `disputed_at` (TIMESTAMPTZ), `created_at`.
+- **`sources.source_integrations`**: Lawful technical integration methods without automated scraping. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `method` (CHECK: `PUBLIC_API`, `GRIEVANCE_EMAIL`, `WEB_FORM`, `OFFLINE_POSTAL`), `endpoint_url` (TEXT), `auth_type` (CHECK: `NONE`, `API_KEY`, `BEARER_TOKEN`, `OAUTH2`), `rate_limit_rpm` (INT), `status` (CHECK: `ACTIVE`, `SUSPENDED`, `DEPRECATED`), `created_at`, `updated_at`.
+- **`sources.source_policies`**: Statutory compliance terms and Grievance Officer details. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `statutory_framework` (`DPDP_ACT_2023`), `grievance_officer_name` (VARCHAR(128)), `grievance_officer_email` (VARCHAR(256)), `grievance_officer_phone` (VARCHAR(32)), `postal_address` (TEXT), `privacy_policy_url` (TEXT), `terms_url` (TEXT), `opt_out_policy_url` (TEXT), `created_at`, `updated_at`.
+- **`sources.source_removal_procedures`**: Prescribed statutory removal workflows. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `procedure_type` (CHECK: `DIRECT_OPT_OUT`, `DPDP_SECTION_12_NOTICE`, `LEGAL_NOTICE`, `ACCOUNT_DELETION`), `required_fields` (VARCHAR[]), `estimated_turnaround_days` (INT), `statutory_basis` (`DPDP_ACT_2023_SECTION_12`), `instructions` (TEXT), `created_at`, `updated_at`. Composite UNIQUE (`source_id`, `procedure_type`).
+- **`sources.source_health_records`**: Periodic availability telemetry and SLA records. Columns: `id` (UUID PK), `source_id` (FK -> `sources.id`), `latency_ms` (INT), `http_status` (INT), `health_status` (CHECK: `HEALTHY`, `DEGRADED`, `DOWN`, `OPERATIONAL`, `UNAVAILABLE`), `details` (JSONB), `checked_at`.
+- **`sources.schema_migrations`**: Service-specific migration ledger. Columns: `version` (VARCHAR(64) PK), `name` (VARCHAR(256)), `applied_at` (TIMESTAMPTZ).
+- **`sources.outbox_messages`**: Transactional outbox for source registry events (`sources.source.created`, `sources.capability.updated`, `sources.source.retired`).
 
 #### 4. Discovery Domain (`discovery`)
 Responsible for asynchronous scan orchestration, execution state tracking, and source-level checks.
@@ -367,14 +398,47 @@ erDiagram
 
 #### Version-Controlled Migration Order
 1. **`001_initial_schema_and_roles.sql`**: Provisions all 9 logical schemas (`CREATE SCHEMA IF NOT EXISTS`), provisions isolated database login roles (`CREATE ROLE ... WITH LOGIN`), revokes public schema permissions, and grants schema-level privileges.
-2. **`002_core_domain_tables.sql`**: Establishes `pgcrypto` extension, creates all 34 domain tables, defines UUID primary keys, check constraints, default timestamps, intra-schema foreign keys with cascade policies, dedicated transactional outbox tables, and access indexes.
-3. **`seeds/dev-seed.sql`**: Idempotently seeds verified Indian public directories (`FastDial`, `India B2B Contact Directory Alpha`, `National Yellow Pages India Beta`, `CityInfo Business Listings`), capabilities, rate limits, and statutory grievance frameworks.
+2. **`002_core_domain_tables.sql`**: Establishes `pgcrypto` extension, creates core domain tables, defines UUID primary keys, check constraints, default timestamps, intra-schema foreign keys with cascade policies, dedicated transactional outbox tables, and access indexes.
+3. **`003_source_registry_capabilities.sql`**: Expands `sources` schema with enterprise metadata (`display_name`, `country`, `industry`), broader category classification, independent capability lifecycle & verification tracking (`source_capabilities`), evidence records (`source_evidence`), safe integrations without scraping (`source_integrations`), privacy/terms policies (`source_policies`), and statutory removal procedures (`source_removal_procedures`).
+4. **`seeds/dev-seed.sql`**: Idempotently seeds verified Indian public directories and initial research candidates under strict UNVERIFIED status.
 
 #### Migration Execution & Tooling
 - Executed via `pnpm db:migrate` (`scripts/init-db.ts`), which runs full static DDL validation and executes SQL against PostgreSQL.
 - Seeding executed via `pnpm db:seed` (`scripts/seed-db.ts`).
 - Schema migrations employ `IF NOT EXISTS` guards, guaranteeing idempotent reproducibility.
 - Rollbacks adhere to a **forward-only** migration philosophy: schema modifications or deprecations are applied via subsequent forward migrations rather than destructive rollbacks in production.
+
+#### Source Registry Persistence Architecture (`apps/source-registry-service`)
+The Source Registry Service features a production-grade PostgreSQL persistence layer utilizing the dedicated `sources` schema and `sources_svc_role`:
+1. **Connection Pooling & Least-Privilege Session Setup**:
+   - Implemented via `pg.Pool` (`src/db/pool.ts`) configured with connection limit (`max: 10`), idle timeout (30,000ms), and connection acquisition timeout (5,000ms).
+   - Enforces a statement timeout (`statement_timeout = '10000'`) on every newly checked-out client to eliminate rogue runaway locks.
+   - Automatically sets search path to `SET search_path TO sources, public` ensuring queries target the correct schema without cross-tenant contamination.
+   - Default service connection string: `postgresql://sources_svc_role:sources_dev_pwd@localhost:5432/nijakavach_dev?schema=sources`.
+2. **Repository Abstraction Layer**:
+   - Clean separation of interface and implementation via `src/repositories/interfaces.ts`:
+     - `ISourceRepository`: CRUD, slug lookups, operational status filtering, pagination, and retirement.
+     - `ISourceCapabilityRepository`: Granular discovery/removal capability management and verification updates.
+     - `ISourceEvidenceRepository`: Evidence tracking, URL/SHA256 digests, and dispute management.
+     - `ISourceIntegrationRepository`: Non-scraping integration definitions (API, Email, Webform).
+     - `ISourcePolicyRepository`: Grievance Officer details and statutory policy linkages.
+     - `ISourceRemovalProcedureRepository`: DPDP Sec 12 statutory instructions and turnaround SLAs.
+     - `ISourceHealthRepository`: Heartbeat telemetry and probe history.
+     - `IOutboxRepository`: Local transactional outbox publishing.
+     - `IAuditRepository`: Local audit event recording.
+   - `PostgresSourceRepository` implementations (`src/repositories/postgres-repositories.ts`) utilize strictly parameterized SQL queries (`$1, $2, ...`), mapping raw database rows to strongly-typed domain models.
+3. **Atomic Multi-Repository Transactions (`withTransaction`)**:
+   - `withTransaction(pool, callback)` manages client checkout, executes `BEGIN`, passes the active transaction client to repository methods, and executes `COMMIT` or `ROLLBACK` on error.
+   - Guarantees atomicity across multi-entity mutations:
+     - Creating a source simultaneously writes the source, initial capabilities, audit trail, and outbox event (`sources.source.created`).
+     - Updating a capability status atomically persists capability state, an audit entry, and a transactional outbox message (`sources.capability.updated`).
+     - Disputing evidence atomically sets dispute metadata, marks the parent source `DISPUTED`, logs an audit entry, and emits an outbox event.
+4. **Service-Level Schema Migrator (`SourceRegistryMigrator`)**:
+   - `src/db/migrator.ts` tracks executed migrations in `sources.schema_migrations` (`version VARCHAR(64) PRIMARY KEY`, `name VARCHAR(256)`, `applied_at TIMESTAMPTZ`).
+   - Automatically inspects and applies SQL migration scripts idempotently on service boot before serving traffic.
+5. **Dual-Mode Testing & Offline Fallback**:
+   - `createRepositories(usePostgres, pool)` initializes either `PostgresRepositories` or structural `MemoryRepositories` implementing the identical contracts.
+   - When PostgreSQL is unavailable or in lightweight local unit test runs (`USE_POSTGRES=false`), the service operates seamlessly in-memory while integration test suites explicitly verify PostgreSQL connectivity without masking offline infrastructure.
 
 ---
 
@@ -557,26 +621,83 @@ flowchart TD
     Mask --> MaskedVal[Masked String Used in UI, Logs, Notifications]
 ```
 
-1. **Deterministic Matching via HMAC-SHA256**: Raw phone numbers span a finite $10^{10}$ keyspace in India, making unsalted MD5/SHA256 trivially reversible via rainbow tables. NIJAKAVACH computes deterministic keyed HMAC-SHA256 using a secure master pepper secret. Database indexes and lookup queries operate solely on the HMAC digest.
-2. **Envelope Encryption (AES-256-GCM)**: Decryptable values are stored encrypted with a 256-bit key managed externally, accessible only when generating formal statutory removal notices.
-3. **Zero Plaintext PII in Telemetry**: Application loggers sanitize payloads, replacing phone numbers, passwords, authorization tokens, and secrets with `[REDACTED_PII]`.
-4. **DPDP Act 2023 Alignment**:
-   - Purpose Limitation (Section 5): Distinct consent scopes for discovery, removal submission, and monitoring.
-   - Right to Withdraw Consent (Section 6(4)): Revocation halts active and recurring background scans immediately.
-   - Right to Correction and Erasure (Section 12): Anonymizes identity records, purges registered identifiers, and strips evidence files from S3.
+1. **API Gateway Perimeter Security**:
+   - Centralized ingress through `apps/api-gateway` on port `4000`.
+   - Strict sliding-window rate limiting per IP (100 requests per minute) returning `429 Too Many Requests` with standard `Retry-After` header.
+   - Strict payload size limits (1MB maximum) preventing buffer overflows and memory exhaustion, returning `413 Payload Too Large`.
+   - Request timeout guards (10s threshold) returning structured `504 Gateway Timeout`.
+   - Automatic security headers injected on every response:
+     - `X-Content-Type-Options: nosniff`
+     - `X-Frame-Options: DENY`
+     - `Content-Security-Policy: default-src 'none'`
+     - `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+2. **Token Handling & Identity Protection**:
+   - Bearer JWT tokens signed with HMAC-SHA256, carrying standard claims (`sub`, `email`, `roles`, `exp`, `iss: nijakavach-platform`).
+   - The Gateway decodes tokens, extracts user identity, and sanitizes incoming request headers to eliminate spoofing. Incoming headers `X-User-Id`, `X-User-Roles`, and `X-Internal-Service-Key` are discarded from client requests before forwarding.
+   - Internal microservices require `X-Internal-Service-Key`, verified via constant-time comparison (`crypto.timingSafeEqual`) to prevent timing side-channel attacks.
+3. **Password Security via Scrypt**:
+   - Password hashing utilizes Node.js native `crypto.scrypt` with a cryptographically secure 16-byte random salt.
+   - Cost parameters: $N = 16384, r = 8, p = 1, \text{derived key length} = 64$ bytes.
+   - Verification uses constant-time comparison (`crypto.timingSafeEqual`) on the derived key buffer to eliminate timing leakage.
+4. **Deterministic Matching via Keyed HMAC-SHA256**:
+   - Raw phone numbers span a finite $10^{10}$ keyspace in India, making unsalted MD5/SHA256 trivially reversible via precomputed rainbow tables.
+   - NIJAKAVACH computes deterministic keyed HMAC-SHA256 using a separate master pepper secret.
+   - Database lookup queries and uniqueness indexes operate solely on the HMAC digest, preserving searchability without exposing cleartext PII.
+5. **Envelope Encryption (AES-256-GCM)**:
+   - Personal identifiers requiring reversible access (for preparing statutory removal notices) are encrypted with AES-256-GCM.
+   - Each ciphertext includes a unique 12-byte initialization vector (IV) and a 16-byte authentication tag ensuring integrity and confidentiality.
+6. **Zero Plaintext PII in Telemetry**:
+   - Loggers across all services sanitize message payloads, replacing phone numbers, emails, passwords, tokens, and internal keys with masked or redacted representations (`maskPhoneNumber`, `maskEmail`, `[REDACTED]`).
+7. **DPDP Act 2023 Alignment**:
+   - **Purpose Limitation (Section 5)**: Separate and explicit consent scopes for discovery, removal submission, and monitoring.
+   - **Right to Withdraw Consent (Section 6(4))**: Revocation halts active and recurring background scans immediately.
+   - **Right to Correction and Erasure (Section 12)**: Anonymizes identity records, purges registered identifiers, and strips evidence files from S3.
+
+6. **Identity, Session & Token Management Strategy**:
+   - **Access & Refresh Token Architecture**:
+     - **Access Token**: Short-lived Bearer JWT (15-minute / 900s expiration) signed with HMAC-SHA256, carrying identity claims (`sub`, `email`, `roles`, `exp`, `iss: nijakavach-platform`). Transmitted in the `Authorization: Bearer <token>` header.
+     - **Refresh Token**: Cryptographically secure 256-bit random token (`rf_<hex>`), stored only in hashed form (`session_token_hash` via SHA-256) in `identity.sessions`, with 7-day expiration.
+     - **Refresh Token Rotation & Reuse Detection**: Using a refresh token invalidates it immediately and issues a new token pair. If an already-consumed or revoked refresh token is presented (potential token theft/replay), the service automatically invalidates all active sessions for that user account.
+     - **Session Revocation & Logout**: Logout immediately marks `revoked_at = NOW()`, terminating subsequent refresh operations.
+7. **Personal Identifier Lifecycle & Security Gates**:
+   - Supported identifiers (starting with `PHONE_NUMBER`) undergo strict normalization (`normalizeE164Phone`).
+   - Identifiers are envelope-encrypted with AES-256-GCM (`encrypted_value`), fingerprinted deterministically with keyed HMAC-SHA256 (`hmac_fingerprint`), and stored with display masking (`masked_display`, e.g. `+9198*****210`).
+   - **Verification Gate**: New identifiers are initialized in `PENDING_VERIFICATION`. An unverified identifier is strictly ineligible for discovery scans or removal submissions.
+8. **DPDP Act 2023 Explicit Statutory Consent Model**:
+   - **Unbundled Processing Purposes**: Account registration does not constitute consent for exposure discovery. Adding a phone number does not constitute consent for processing. Distinct consent records are captured per purpose (`PURPOSE_IDENTIFIER_STORAGE`, `PURPOSE_DISCOVERY_SCAN`, `PURPOSE_EVIDENCE_PROCESSING`, `PURPOSE_REMOVAL_SUBMISSION`, `PURPOSE_PERSISTENT_MONITORING`).
+   - **Auditable & Immutable Records**: Captures `notice_version`, SHA-256 digest of exact notice text shown (`notice_hash_sha256`), IP address, and timestamp.
+   - **Withdrawal Semantics**: Consent withdrawal updates `status = 'WITHDRAWN'` with timestamp and reason; historical records are preserved for regulatory audit and never physically deleted.
+   - **Pre-Operation Eligibility Engine**: The `verifyOperationEligibility` interface enforces that an operation can only proceed if the user is authenticated, the identifier is verified, and active un-withdrawn consent exists for the exact requested purpose.
+9. **Action Authorisation vs. General Consent**:
+   - While consent covers broad processing purposes, removal operations require specific case-by-case electronic authorization under Section 12 of the DPDP Act.
+   - Authorisation records capture case ID, source ID, statutory basis, signed authorization statement, and a cryptographic HMAC signature proof binding `userId + caseId + sourceId + timestamp`.
+10. **Data Rights & Account Deletion Requests**:
+    - Account deletion requests are formally queued with statutory status tracking (`RECEIVED` → `PROCESSING` → `COMPLETED`).
+    - Differentiates operational data erasure from legally mandated security and audit ledger retention.
 
 ---
 
 ## 8. Scalability and Reliability
 
-1. **Stateless Service Tier**: All API microservices are stateless. Authentication state is cryptographically self-contained in asymmetric JWTs or verified against distributed Redis session stores, allowing unconstrained horizontal scaling behind Layer 7 balancers.
-2. **Worker Pool Auto-Scaling**: Source Adapter Workers scale horizontally based on RabbitMQ queue backlog (`jobs.discovery.source-check`, `jobs.removal.submit`).
-3. **Circuit Breakers & Source Rate Limits**:
-   - Circuit breakers monitor external source domains. If failure rates exceed 40% over a 1-minute sliding window, the breaker opens, failing fast and delaying subsequent source checks for 5 minutes.
-   - Per-source rate limiting in Redis enforces external directory capacity limits and robots/ToS terms.
-4. **Exponential Backoff with Jitter**:
-   $$\text{Delay}(n) = \text{random}(0, \min(300000\text{ ms}, 1000\text{ ms} \times 2^n))$$
-   Guarantees retry buffering without thundering herd failures.
+1. **Stateless Microservice Tier**:
+   - All backend microservices are stateless and decouple business logic from local state.
+   - Ingress load can scale horizontally behind Layer 7 reverse proxies and API Gateways.
+2. **Controlled Concurrency Worker Pool (`apps/source-workers`)**:
+   - Worker pool maintains a bounded concurrency capacity (`maxConcurrency`) to prevent external source rate-limit exhaustion and process overload.
+   - Enforces execution timeout guards (configurable default 15s) using `Promise.race`, terminating hanging scraper or HTTP jobs.
+   - Implements graceful shutdown: intercepts `SIGTERM` / `SIGINT`, rejects new jobs immediately, and waits for in-flight tasks to drain cleanly within a configurable timeout.
+3. **Sliding-Window Rate Limiting & Source Throttling**:
+   - API Gateway enforces per-client IP sliding-window rate limiting to insulate downstream microservices from denial-of-service attempts.
+   - Source Worker adapters enforce per-source crawl rate limits based on target domain capabilities (`rateLimitPerMinute`) and robots.txt/ToS restrictions.
+4. **Exponential Backoff with Full Jitter Strategy**:
+   - Retries for both transactional outbox dispatching and background worker execution follow the full jitter backoff formula:
+     $$\text{Delay}(\text{attempt}) = \text{random}(0, \min(\text{maxMs}, \text{baseMs} \times 2^{\text{attempt}}))$$
+   - Prevents distributed thundering herd spikes and harmonizes retry intervals across failed worker attempts.
+5. **Dead-Letter Queue Routing**:
+   - Any job or event that exhausts its configured retry limit (`maxRetries`) is automatically diverted to a dedicated dead-letter queue (`*.dlx`) alongside failure reasons and timestamps, preventing poison message death-spirals while retaining events for remediation.
+6. **Observability & Liveness / Readiness Probes**:
+   - Every service exposes `/health` (process liveness verifying event loop health) and `/ready` (dependency readiness verifying database schemas and message broker availability).
+   - Failing critical components mark readiness as `DOWN` with HTTP 503, preventing traffic routing during cold starts or transient outages.
 
 ---
 
@@ -633,6 +754,8 @@ graph TD
 | **0003** | Asynchronous Messaging & Transactional Outbox | Adopted RabbitMQ for resilient job buffering and domain events. Enforced transactional outbox pattern to guarantee at-least-once delivery with consumer deduplication. |
 | **0004** | Cryptographic PII Protection Standard | Enforced tripartite PII handling: E.164 normalization, AES-256-GCM envelope encryption at rest, and keyed HMAC-SHA256 fingerprinting for deterministic indexing. Prohibited raw PII in logs, URLs, and telemetry. |
 | **0005** | Evidence Storage & Presigned URLs | Adopted S3-compatible object storage with SHA-256 integrity verification. Mediate client evidence viewing through 15-minute presigned URLs to keep database lightweight. |
+| **0006** | Dual-Token Authentication with Refresh Token Rotation | Adopted 15-minute Bearer JWTs paired with 7-day cryptographically secure refresh tokens stored only as SHA-256 hashes. Automatic rotation invalidates previous tokens and revokes all active sessions upon replay detection. |
+| **0007** | Explicit Unbundled Consent & Case Authorisation Separation | Mandated unbundled purpose-specific consent under DPDP Act Section 6, separate from specific case-by-case removal authorisations under Section 12. Implemented pre-operation eligibility gates blocking unverified identifiers and missing consent. |
 
 ---
 

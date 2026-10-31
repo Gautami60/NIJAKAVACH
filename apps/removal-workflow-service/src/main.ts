@@ -1,155 +1,213 @@
 import * as http from "node:http";
+import * as crypto from "node:crypto";
 import { validateEnv, BaseEnvSchema } from "@nijakavach/config";
 import { createLogger } from "@nijakavach/logger";
 import { HealthChecker, generateCorrelationId } from "@nijakavach/observability";
 import { CreateRemovalRequestSchema, AuthoriseRemovalRequestSchema } from "@nijakavach/contracts";
+import { validateInternalServiceKey } from "@nijakavach/security";
 import { ExposureLifecycleState } from "@nijakavach/shared-types";
 
-const env = validateEnv(BaseEnvSchema);
-const logger = createLogger("removal-workflow-service", env.LOG_LEVEL);
-const healthChecker = new HealthChecker("removal-workflow-service");
+export interface RemovalServerOptions {
+  port?: number;
+  internalApiKey?: string;
+}
 
-// In-memory demo store representing removals schema
-const removalRequests = new Map<string, any>();
+export function createRemovalServer(options?: RemovalServerOptions): {
+  server: http.Server;
+  healthChecker: HealthChecker;
+  removalRequests: Map<string, any>;
+} {
+  const env = validateEnv(BaseEnvSchema);
+  const internalApiKey = options?.internalApiKey || env.INTERNAL_SERVICE_API_KEY;
+  const logger = createLogger("removal-workflow-service", env.LOG_LEVEL);
+  const healthChecker = new HealthChecker("removal-workflow-service");
 
-healthChecker.registerComponentCheck("removals_db_schema", async () => ({
-  status: "UP",
-  message: "Schema 'removals' reachable"
-}));
+  // In-memory demo store representing removals schema
+  const removalRequests = new Map<string, any>();
 
-healthChecker.registerComponentCheck("rabbitmq_submission_queue", async () => ({
-  status: "UP",
-  message: "Connected to jobs.removal.submit"
-}));
+  healthChecker.registerComponentCheck("removals_db_schema", async () => ({
+    status: "UP",
+    message: "Schema 'removals' reachable"
+  }));
 
-const server = http.createServer(async (req, res) => {
-  const correlationId = (req.headers["x-correlation-id"] as string) || generateCorrelationId();
-  const userId = (req.headers["x-user-id"] as string) || "usr-default-demo";
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("X-Correlation-Id", correlationId);
+  healthChecker.registerComponentCheck("rabbitmq_submission_queue", async () => ({
+    status: "UP",
+    message: "Connected to jobs.removal.submit"
+  }));
 
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const server = http.createServer(async (req, res) => {
+    const correlationId = (req.headers["x-correlation-id"] as string) || generateCorrelationId();
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("X-Correlation-Id", correlationId);
 
-  if (url.pathname === "/health") {
-    const health = await healthChecker.execute();
-    res.writeHead(health.status === "DOWN" ? 503 : 200);
-    res.end(JSON.stringify(health));
-    return;
-  }
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-  const parseBody = async (): Promise<unknown> => {
-    return new Promise((resolve, reject) => {
-      let body = "";
-      req.on("data", chunk => { body += chunk; });
-      req.on("end", () => {
-        try { resolve(body ? JSON.parse(body) : {}); }
-        catch (err) { reject(err); }
+    const sendJson = (statusCode: number, payload: unknown) => {
+      res.writeHead(statusCode);
+      res.end(JSON.stringify(payload));
+    };
+
+    const sendError = (statusCode: number, code: string, message: string) => {
+      sendJson(statusCode, {
+        success: false,
+        error: { code, message },
+        requestId: correlationId
       });
-    });
-  };
+    };
 
-  // Prepare Removal Request
-  if (req.method === "POST" && url.pathname === "/v1/removals") {
-    try {
-      const raw = await parseBody();
-      const body = CreateRemovalRequestSchema.parse(raw);
+    if (url.pathname === "/health") {
+      sendJson(200, healthChecker.executeLiveness());
+      return;
+    }
 
-      const removalId = crypto.randomUUID();
-      const removal = {
-        id: removalId,
-        caseId: body.caseId,
-        userId,
-        statutoryBasis: body.statutoryBasis,
-        state: ExposureLifecycleState.REQUEST_PREPARED,
-        createdAt: new Date().toISOString(),
-        authorisedAt: null
-      };
+    if (url.pathname === "/ready") {
+      const ready = await healthChecker.executeReadiness();
+      sendJson(ready.status === "DOWN" ? 503 : 200, ready);
+      return;
+    }
 
-      removalRequests.set(removalId, removal);
+    // Validate internal key
+    const providedKey = req.headers["x-internal-service-key"] as string | undefined;
+    if (!validateInternalServiceKey(providedKey, internalApiKey)) {
+      sendError(403, "FORBIDDEN", "Direct service access prohibited; requests must route through API Gateway.");
+      return;
+    }
 
-      logger.info("Removal request prepared, awaiting user statutory authorisation", {
-        correlationId,
-        removalId,
-        caseId: body.caseId
+    const userId = req.headers["x-user-id"] as string | undefined;
+    if (!userId) {
+      sendError(401, "UNAUTHORIZED", "Missing authenticated user context.");
+      return;
+    }
+
+    const parseBody = async (): Promise<unknown> => {
+      return new Promise((resolve, reject) => {
+        let body = "";
+        req.on("data", chunk => {
+          body += chunk;
+        });
+        req.on("end", () => {
+          try {
+            resolve(body ? JSON.parse(body) : {});
+          } catch (err) {
+            reject(err);
+          }
+        });
       });
+    };
 
-      res.writeHead(201);
-      res.end(JSON.stringify({ success: true, data: removal }));
-      return;
-    } catch (err: any) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ success: false, error: { code: "VALIDATION_ERROR", message: err.message } }));
-      return;
+    // Prepare Removal Request
+    if (req.method === "POST" && url.pathname === "/v1/removals") {
+      try {
+        const raw = await parseBody();
+        const body = CreateRemovalRequestSchema.parse(raw);
+
+        const removalId = crypto.randomUUID();
+        const removal = {
+          id: removalId,
+          caseId: body.caseId,
+          userId,
+          statutoryBasis: body.statutoryBasis,
+          state: ExposureLifecycleState.REQUEST_PREPARED,
+          createdAt: new Date().toISOString(),
+          authorisedAt: null
+        };
+
+        removalRequests.set(removalId, removal);
+
+        logger.info("Removal request prepared, awaiting user statutory authorisation", {
+          correlationId,
+          removalId,
+          caseId: body.caseId
+        });
+
+        sendJson(201, {
+          success: true,
+          data: removal,
+          requestId: correlationId
+        });
+        return;
+      } catch (err: any) {
+        sendError(400, "VALIDATION_ERROR", err.message || "Invalid removal request fields");
+        return;
+      }
     }
-  }
 
-  // Authorise Removal Request
-  if (req.method === "POST" && url.pathname.endsWith("/authorise")) {
-    const id = url.pathname.split("/")[3];
-    if (!id) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ success: false, error: { code: "BAD_REQUEST", message: "Missing removal id" } }));
-      return;
+    // Authorise Removal Request
+    if (req.method === "POST" && url.pathname.endsWith("/authorise")) {
+      const id = url.pathname.split("/")[3];
+      if (!id) {
+        sendError(400, "BAD_REQUEST", "Missing removal id");
+        return;
+      }
+      const removal = removalRequests.get(id);
+      if (!removal) {
+        sendError(404, "REMOVAL_NOT_FOUND", "Removal request not found");
+        return;
+      }
+
+      try {
+        const raw = await parseBody();
+        const body = AuthoriseRemovalRequestSchema.parse(raw);
+
+        removal.state = ExposureLifecycleState.REQUEST_SUBMITTED;
+        removal.authorisedAt = body.consentTimestamp;
+        removal.authorisationStatement = body.authorizationStatement;
+        removalRequests.set(id, removal);
+
+        logger.info("Removal request formally authorised and submitted to worker queues", {
+          correlationId,
+          removalId: id,
+          userId
+        });
+
+        sendJson(200, {
+          success: true,
+          data: removal,
+          requestId: correlationId
+        });
+        return;
+      } catch (err: any) {
+        sendError(400, "VALIDATION_ERROR", err.message || "Invalid authorization fields");
+        return;
+      }
     }
-    const removal = removalRequests.get(id);
-    if (!removal) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ success: false, error: { code: "REMOVAL_NOT_FOUND", message: "Removal request not found" } }));
-      return;
-    }
 
-    try {
-      const raw = await parseBody();
-      const body = AuthoriseRemovalRequestSchema.parse(raw);
-
-      removal.state = ExposureLifecycleState.REQUEST_SUBMITTED;
-      removal.authorisedAt = body.consentTimestamp;
-      removal.authorisationStatement = body.authorizationStatement;
-      removalRequests.set(id, removal);
-
-      logger.info("Removal request formally authorised and submitted to worker queues", {
-        correlationId,
-        removalId: id,
-        userId
+    // Get Removal Details
+    if (req.method === "GET" && url.pathname.startsWith("/v1/removals/")) {
+      const id = url.pathname.split("/")[3];
+      if (!id) {
+        sendError(400, "BAD_REQUEST", "Missing removal id");
+        return;
+      }
+      const removal = removalRequests.get(id);
+      if (!removal) {
+        sendError(404, "REMOVAL_NOT_FOUND", "Removal request not found");
+        return;
+      }
+      sendJson(200, {
+        success: true,
+        data: removal,
+        requestId: correlationId
       });
-
-      res.writeHead(200);
-      res.end(JSON.stringify({ success: true, data: removal }));
-      return;
-    } catch (err: any) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ success: false, error: { code: "VALIDATION_ERROR", message: err.message } }));
       return;
     }
-  }
 
-  // Get Removal Details
-  if (req.method === "GET" && url.pathname.startsWith("/v1/removals/")) {
-    const id = url.pathname.split("/")[3];
-    if (!id) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ success: false, error: { code: "BAD_REQUEST", message: "Missing removal id" } }));
-      return;
-    }
-    const removal = removalRequests.get(id);
-    if (!removal) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ success: false, error: { code: "REMOVAL_NOT_FOUND", message: "Removal request not found" } }));
-      return;
-    }
-    res.writeHead(200);
-    res.end(JSON.stringify({ success: true, data: removal }));
-    return;
-  }
+    sendError(404, "NOT_FOUND", "Endpoint not found");
+  });
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ success: false, error: { code: "NOT_FOUND", message: "Endpoint not found" } }));
-});
+  return { server, healthChecker, removalRequests };
+}
 
-const PORT = 4006;
-server.listen(PORT, () => {
-  logger.info(`NIJAKAVACH Removal Workflow Service listening on port ${PORT}`);
-});
+if (require.main === module) {
+  const env = validateEnv(BaseEnvSchema);
+  const logger = createLogger("removal-workflow-service", env.LOG_LEVEL);
+  const { server } = createRemovalServer();
+  const PORT = 4006;
 
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)));
+  server.listen(PORT, () => {
+    logger.info(`NIJAKAVACH Removal Workflow Service listening on port ${PORT}`);
+  });
+
+  process.on("SIGTERM", () => server.close(() => process.exit(0)));
+  process.on("SIGINT", () => server.close(() => process.exit(0)));
+}

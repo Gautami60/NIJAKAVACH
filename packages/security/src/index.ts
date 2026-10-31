@@ -167,3 +167,66 @@ export function verifyJwt<T extends TokenPayload>(token: string, secret: string)
     issuer: "nijakavach-platform"
   }) as T;
 }
+
+/**
+ * Validates internal service mesh secret using constant-time comparison.
+ * Protects downstream microservices from direct unauthenticated calls.
+ */
+export function validateInternalServiceKey(providedKey: string | undefined, expectedKey: string): boolean {
+  if (!providedKey || !expectedKey) return false;
+  if (providedKey.length !== expectedKey.length) return false;
+
+  const bufProvided = Buffer.from(providedKey);
+  const bufExpected = Buffer.from(expectedKey);
+  return crypto.timingSafeEqual(bufProvided, bufExpected);
+}
+
+/**
+ * Extracts Bearer token from HTTP Authorization header.
+ */
+export function extractBearerToken(authHeader: string | undefined): string | null {
+  if (!authHeader) return null;
+  const parts = authHeader.trim().split(" ");
+  if (parts.length === 2 && parts[0]?.toLowerCase() === "bearer" && parts[1]) {
+    return parts[1];
+  }
+  return null;
+}
+
+/**
+ * Authenticates an incoming Bearer token and returns the verified user identity.
+ * Returns null if the token is missing, expired, or tampered.
+ */
+export function authenticateBearerToken(
+  authHeader: string | undefined,
+  secret: string
+): { userId: string; email: string; roles: string[] } | null {
+  const token = extractBearerToken(authHeader);
+  if (!token) return null;
+
+  try {
+    const verified = verifyJwt(token, secret);
+    return {
+      userId: verified.sub,
+      email: verified.email,
+      roles: verified.roles || []
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generates a cryptographically secure random token (e.g. for email verification, password reset, or refresh tokens).
+ */
+export function generateSecureToken(byteLength = 32): string {
+  return crypto.randomBytes(byteLength).toString("hex");
+}
+
+/**
+ * Computes a SHA-256 hash of a verification or reset token for secure storage at rest.
+ * Prevents cleartext token exposure if the datastore is breached.
+ */
+export function hashToken(token: string): string {
+  return crypto.createHash("sha256").update(token.trim()).digest("hex");
+}

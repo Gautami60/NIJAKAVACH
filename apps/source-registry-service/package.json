@@ -7,7 +7,9 @@
     "start": "node dist/main.js",
     "dev": "tsx watch src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/main.test.js"
+    "test": "node --test dist/main.test.js dist/persistence.integration.test.js",
+    "test:unit": "node --test dist/main.test.js",
+    "test:integration": "node --test dist/persistence.integration.test.js"
   },
   "dependencies": {
     "@nijakavach/config": "workspace:*",
@@ -15,10 +17,12 @@
     "@nijakavach/event-contracts": "workspace:*",
     "@nijakavach/logger": "workspace:*",
     "@nijakavach/observability": "workspace:*",
-    "@nijakavach/shared-types": "workspace:*"
+    "@nijakavach/shared-types": "workspace:*",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }

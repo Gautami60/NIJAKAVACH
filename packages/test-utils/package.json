@@ -7,10 +7,13 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/database-invariants.test.js",
+    "test": "node --test dist/database-invariants.test.js dist/service-communication.test.js",
     "lint": "echo 'No lint needed for test-utils'"
   },
   "dependencies": {
+    "@nijakavach/contracts": "workspace:*",
+    "@nijakavach/event-contracts": "workspace:*",
+    "@nijakavach/observability": "workspace:*",
     "@nijakavach/security": "workspace:*",
     "@nijakavach/shared-types": "workspace:*"
   },

@@ -53,3 +53,28 @@ export const PaginationQuerySchema = z.object({
 });
 
 export type PaginationQuery = z.infer<typeof PaginationQuerySchema>;
+
+/**
+ * Strict HTTP/HTTPS URL Schema (SSRF protection baseline)
+ */
+export const HttpUrlSchema = z
+  .string()
+  .trim()
+  .url({ message: "Invalid URL format" })
+  .max(512)
+  .refine(
+    (val) => {
+      if (!val.startsWith("http://") && !val.startsWith("https://")) return false;
+      const lower = val.toLowerCase();
+      if (
+        lower.includes("://localhost") ||
+        lower.includes("://127.0.0.1") ||
+        lower.includes("://::1") ||
+        lower.includes("://169.254.169.254")
+      ) {
+        return false;
+      }
+      return true;
+    },
+    { message: "URL must be a public HTTP or HTTPS address" }
+  );
